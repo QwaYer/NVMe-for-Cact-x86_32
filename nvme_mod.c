@@ -14,20 +14,21 @@
 #include "pci_enum.h"
 #include "devfs.h"
 #include "sync.h"
+#include "klib.h"
 
-extern void     kprint(char* s);
-extern void     kprint_hex(uint32_t v);
-extern void     klog(int level, const char* msg);
+extern void     printk(const char* fmt, ...);
+extern void     printk_hex(uint32_t v);
+
 extern void*    kmalloc_aligned(uint32_t size, uint32_t align);
-extern void     kfree_aligned(void* p);
+extern void     kfree(void* p);
 extern void*    memset(void* s, int c, uint32_t n);
 extern void*    memcpy(void* dst, const void* src, uint32_t n);
-extern void     itoa(int n, char* str);
-extern uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
-extern void     pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
+
+extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
+extern void     pci_write_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
                             uint32_t val);
-extern uint8_t  port_byte_in (uint16_t port);
-extern void     port_byte_out(uint16_t port, uint8_t val);
+extern uint8_t  inb (uint16_t port);
+extern void     outb(uint16_t port, uint8_t val);
 extern void     vmm_map(uint32_t* pd, uint32_t va, uint32_t pa, int flags);
 extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
@@ -56,24 +57,21 @@ extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
 extern void     sema_init   (semaphore_t* s, int val);
-extern void     sema_down   (semaphore_t* s);
-extern void     sema_up     (semaphore_t* s);
-extern devfs_entry_t* devfs_register  (const char* name, uint32_t flags,
+extern void     down   (semaphore_t* s);
+extern void     up     (semaphore_t* s);
+extern devfs_entry_t* register_chrdev  (const char* name, uint32_t flags,
                                        devfs_driver_t* drv, void* drv_priv);
-extern int            devfs_unregister(const char* name);
-extern int blkdev_register(const char *name, uint32_t max_lba,
+extern int            unregister_chrdev(const char* name);
+extern int register_blkdev(const char *name, uint32_t max_lba,
                            void (*read_sector)(uint32_t lba, uint8_t *buf),
                            void (*write_sector)(uint32_t lba, uint8_t *buf));
-extern void blkdev_unregister(const char *name);
+extern void unregister_blkdev(const char *name);
 
 #define PAGE_PRESENT 0x1
 #define PAGE_RW      0x2
 #define PAGE_PWT     0x8
 #define PAGE_PCD     0x10
 
-#define KLOG_OK    0
-#define KLOG_WARN  1
-#define KLOG_FAIL  3
 
 static inline uint32_t* get_current_pd(void) {
     uint32_t val;
@@ -114,7 +112,7 @@ static void nvme_wait_ready(int expected) {
     for (int i = 0; i < 1000000; i++)
         if (((ndev.bar->csts >> 0) & 1) == (uint32_t)expected)
             return;
-    kprint("[NVMe] controller timeout\n");
+    printk("[NVMe] controller timeout\n");
 }
 
 static void admin_submit(struct nvme_sq_entry *cmd) {
@@ -137,18 +135,18 @@ static int admin_poll(void) {
             *q->cq_db = q->cq_head;
             if (status & 0x7FF) {
                 char tmp[16];
-                kprint("[NVMe] admin err raw=");
-                kprint_hex(raw);
-                kprint(" SC=");
-                itoa(status & 0xFF, tmp); kprint(tmp);
-                kprint(" SCT=");
-                itoa((status >> 8) & 0x7, tmp); kprint(tmp);
-                kprint("\n");
+                printk("[NVMe] admin err raw=");
+                printk_hex(raw);
+                printk(" SC=");
+                printk("%d", (int)(status & 0xFF));
+                printk(" SCT=");
+                printk("%d", (int)((status >> 8) & 0x7));
+                printk("\n");
             }
             return (status & 0x7FF) ? -1 : 0;
         }
     }
-    kprint("[NVMe] admin_poll TIMEOUT\n");
+    printk("[NVMe] admin_poll TIMEOUT\n");
     return -1;
 }
 
@@ -181,14 +179,14 @@ static void nvme_irq_handler(void) {
 
     if (wake && io_inflight) {
         io_inflight = 0;
-        sema_up(&io_done);
+        up(&io_done);
     }
 }
 
 /* Polled IO completion. Used as a fallback (and by default in this build)
  * because the QEMU NVMe device on the q35 PCIe root complex prefers MSI/MSI-X
  * for completion delivery. Until we wire up MSI here, IRQ 11 stays silent and
- * an IRQ-only path would deadlock the bootstrap thread on sema_down. Polling
+ * an IRQ-only path would deadlock the bootstrap thread on down. Polling
  * the CQ phase bit works regardless of how the controller is configured to
  * raise interrupts, just like admin_poll does for admin commands. */
 static int nvme_io_poll(void) {
@@ -209,7 +207,7 @@ static int nvme_io_poll(void) {
             return 0;
         }
     }
-    kprint("[NVMe] io_poll TIMEOUT\n");
+    printk("[NVMe] io_poll TIMEOUT\n");
     io_inflight = 0;
     io_error    = 1;
     return -1;
@@ -275,7 +273,7 @@ static int nvme_set_num_queues(void) {
     cmd.cdw10 = 0x07;
     cmd.cdw11 = (0 << 16) | 0;
     if (admin_cmd(&cmd) < 0) {
-        kprint("[NVMe] Set Features (Num Queues) failed\n");
+        printk("[NVMe] Set Features (Num Queues) failed\n");
         return -1;
     }
     return 0;
@@ -304,7 +302,7 @@ static int nvme_create_io_queues(void) {
     cmd.cdw10 = ((NVME_IO_QUEUE_SIZE - 1) << 16) | 1;
     cmd.cdw11 = 0x03; /* physically contiguous | interrupts enabled */
     if (admin_cmd(&cmd) < 0) {
-        kprint("[NVMe] create IO CQ failed\n");
+        printk("[NVMe] create IO CQ failed\n");
         return -1;
     }
 
@@ -314,7 +312,7 @@ static int nvme_create_io_queues(void) {
     cmd.cdw10 = ((NVME_IO_QUEUE_SIZE - 1) << 16) | 1;
     cmd.cdw11 = (1 << 16) | 0x01;
     if (admin_cmd(&cmd) < 0) {
-        kprint("[NVMe] create IO SQ failed\n");
+        printk("[NVMe] create IO SQ failed\n");
         return -1;
     }
     return 0;
@@ -329,7 +327,7 @@ static int nvme_identify(void) {
     cmd.prp1  = (uint32_t)identify_buf;
     cmd.cdw10 = 1;
     if (admin_cmd(&cmd) < 0) {
-        kprint("[NVMe] identify controller failed\n");
+        printk("[NVMe] identify controller failed\n");
         return -1;
     }
 
@@ -340,7 +338,7 @@ static int nvme_identify(void) {
     cmd.prp1  = (uint32_t)identify_buf;
     cmd.cdw10 = 0;
     if (admin_cmd(&cmd) < 0) {
-        kprint("[NVMe] identify namespace failed\n");
+        printk("[NVMe] identify namespace failed\n");
         return -1;
     }
 
@@ -362,11 +360,11 @@ static int nvme_alloc_queues(void) {
 }
 
 static void nvme_free_queues(void) {
-    if (admin_sq_mem) { kfree_aligned(admin_sq_mem); admin_sq_mem = NULL; }
-    if (admin_cq_mem) { kfree_aligned(admin_cq_mem); admin_cq_mem = NULL; }
-    if (io_sq_mem)    { kfree_aligned(io_sq_mem);    io_sq_mem = NULL; }
-    if (io_cq_mem)    { kfree_aligned(io_cq_mem);    io_cq_mem = NULL; }
-    if (identify_buf) { kfree_aligned(identify_buf); identify_buf = NULL; }
+    if (admin_sq_mem) { kfree(admin_sq_mem); admin_sq_mem = NULL; }
+    if (admin_cq_mem) { kfree(admin_cq_mem); admin_cq_mem = NULL; }
+    if (io_sq_mem)    { kfree(io_sq_mem);    io_sq_mem = NULL; }
+    if (io_cq_mem)    { kfree(io_cq_mem);    io_cq_mem = NULL; }
+    if (identify_buf) { kfree(identify_buf); identify_buf = NULL; }
 }
 
 static int nvme_devfs_read(void *p, uint32_t off, uint32_t size, char *buffer) {
@@ -383,14 +381,14 @@ static int nvme_devfs_read(void *p, uint32_t off, uint32_t size, char *buffer) {
         if (n > size - done) n = size - done;
 
         if (nvme_sync_rw(lba, sector, 0) < 0) {
-            kfree_aligned(sector);
+            kfree(sector);
             return -1;
         }
         memcpy(buffer + done, sector + in_sec, n);
         done += n;
     }
 
-    kfree_aligned(sector);
+    kfree(sector);
     return (int)done;
 }
 
@@ -408,18 +406,18 @@ static int nvme_devfs_write(void *p, uint32_t off, uint32_t size, char *buffer) 
         if (n > size - done) n = size - done;
 
         if (nvme_sync_rw(lba, sector, 0) < 0) {
-            kfree_aligned(sector);
+            kfree(sector);
             return -1;
         }
         memcpy(sector + in_sec, buffer + done, n);
         if (nvme_sync_rw(lba, sector, 1) < 0) {
-            kfree_aligned(sector);
+            kfree(sector);
             return -1;
         }
         done += n;
     }
 
-    kfree_aligned(sector);
+    kfree(sector);
     return (int)done;
 }
 
@@ -429,7 +427,7 @@ static int nvme_devfs_status(void *p, char *buf, uint32_t size) {
     const char *s = "device: nvme0\ntype: NVMe (IRQ)\nmax_lba: ";
     while (s[pos] && (uint32_t)pos < size - 1) { buf[pos] = s[pos]; pos++; }
     char tmp[16];
-    itoa((int)ndev.max_lba, tmp);
+    snprintf(tmp, sizeof(tmp), "%d", (int)((int)ndev.max_lba));
     for (int i = 0; tmp[i] && (uint32_t)pos < size - 1; i++) buf[pos++] = tmp[i];
     if ((uint32_t)pos < size - 1) buf[pos++] = '\n';
     buf[pos] = '\0';
@@ -452,10 +450,10 @@ static void nvme_blk_write_sector(uint32_t lba, uint8_t *buf) {
 }
 
 static void nvme_detach(void) {
-    blkdev_unregister("nvme0");
+    unregister_blkdev("nvme0");
 
     if (devfs_was_registered) {
-        devfs_unregister("nvme0");
+        unregister_chrdev("nvme0");
         devfs_was_registered = 0;
     }
 
@@ -475,7 +473,7 @@ static void nvme_detach(void) {
     }
 
     if (nvme_attached)
-        pci_write32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, saved_pci_cmd_dw);
+        pci_write_config_dword(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, saved_pci_cmd_dw);
 
     nvme_free_queues();
     memset(&ndev, 0, sizeof(ndev));
@@ -488,11 +486,11 @@ static void nvme_detach(void) {
 int pci_driver_probe(pci_device_t *pdev) {
     if (!pdev) return -1;
     if (nvme_attached) {
-        kprint("[NVMe] already attached, skipping additional controller\n");
+        printk("[NVMe] already attached, skipping additional controller\n");
         return -1;
     }
     if (pdev->prog_if != 0x02) {
-        kprint("[NVMe] prog_if!=0x02, skipping\n");
+        printk("[NVMe] prog_if!=0x02, skipping\n");
         return -1;
     }
 
@@ -507,20 +505,20 @@ int pci_driver_probe(pci_device_t *pdev) {
     ndev.pci_dev = pdev->dev;
     ndev.pci_fn  = pdev->fn;
 
-    kprint("[NVMe] probe bus=");
-    kprint_hex(ndev.pci_bus); kprint(" dev="); kprint_hex(ndev.pci_dev);
-    kprint(" fn="); kprint_hex(ndev.pci_fn);
-    kprint(" irq="); kprint_hex(pdev->irq_line); kprint("\n");
+    printk("[NVMe] probe bus=");
+    printk_hex(ndev.pci_bus); printk(" dev="); printk_hex(ndev.pci_dev);
+    printk(" fn="); printk_hex(ndev.pci_fn);
+    printk(" irq="); printk_hex(pdev->irq_line); printk("\n");
 
-    uint32_t bar0 = pci_read32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x10);
+    uint32_t bar0 = pci_read_config_dword(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x10);
     ndev.bar_phys = bar0 & 0xFFFFF000;
     if (!ndev.bar_phys) {
-        klog(KLOG_FAIL, "NVMe (kmod): BAR0 missing");
+        printk("3" "NVMe (kmod): BAR0 missing");
         return -1;
     }
 
     if (nvme_alloc_queues() < 0) {
-        klog(KLOG_FAIL, "NVMe (kmod): queue allocation failed");
+        printk("3" "NVMe (kmod): queue allocation failed");
         nvme_detach();
         return -1;
     }
@@ -530,10 +528,10 @@ int pci_driver_probe(pci_device_t *pdev) {
                 PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
     ndev.bar = (volatile struct nvme_bar *)(uintptr_t)ndev.bar_phys;
 
-    saved_pci_cmd_dw = pci_read32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04);
+    saved_pci_cmd_dw = pci_read_config_dword(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04);
     uint32_t cmd = saved_pci_cmd_dw;
     cmd |= 0x06u;           /* MEM | BUS_MASTER */
-    pci_write32(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, cmd);
+    pci_write_config_dword(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, cmd);
 
     /* Enable MSI-X for interrupt-driven I/O (replaces poll-only fallback). */
     {
@@ -548,39 +546,39 @@ int pci_driver_probe(pci_device_t *pdev) {
                 pci_msix_enable(pdev, vec, table, 0);
                 nvme_msix_vector = vec;
                 nvme_irq_armed   = 1;
-                klog(KLOG_OK, "NVMe: MSI-X enabled");
+                printk("6" "NVMe: MSI-X enabled");
             }
         }
         if (nvme_msix_vector < 0)
-            klog(KLOG_WARN, "NVMe: MSI-X unavailable — poll-only");
+            printk("4" "NVMe: MSI-X unavailable — poll-only");
     }
 
     uint64_t cap = ndev.bar->cap;
     ndev.db_stride = 4 << ((cap >> 32) & 0xF);
 
-    kprint("[NVMe] resetting controller\n");
+    printk("[NVMe] resetting controller\n");
     ndev.bar->intms = 0xFFFFFFFFu;
     ndev.bar->cc = 0;
     nvme_wait_ready(0);
 
     nvme_setup_admin_queues();
 
-    kprint("[NVMe] enabling controller\n");
+    printk("[NVMe] enabling controller\n");
     ndev.bar->cc = (4 << 20) | (6 << 16) | (0 << 7) | 1;
     nvme_wait_ready(1);
     if (ndev.bar->csts & 0x2) {
-        klog(KLOG_FAIL, "NVMe (kmod): controller fatal status");
+        printk("3" "NVMe (kmod): controller fatal status");
         nvme_detach();
         return -1;
     }
 
     if (nvme_identify() < 0) {
-        klog(KLOG_FAIL, "NVMe (kmod): identify failed");
+        printk("3" "NVMe (kmod): identify failed");
         nvme_detach();
         return -1;
     }
     if (nvme_set_num_queues() < 0 || nvme_create_io_queues() < 0) {
-        klog(KLOG_FAIL, "NVMe (kmod): IO queue setup failed");
+        printk("3" "NVMe (kmod): IO queue setup failed");
         nvme_detach();
         return -1;
     }
@@ -589,19 +587,19 @@ int pci_driver_probe(pci_device_t *pdev) {
     nvme_ready = 1;
     nvme_attached = 1;
 
-    if (devfs_register("nvme0", DEVFS_F_BLOCK, &nvme_drv, 0))
+    if (register_chrdev("nvme0", DEVFS_F_BLOCK, &nvme_drv, 0))
         devfs_was_registered = 1;
     else
-        klog(KLOG_WARN, "NVMe (kmod): devfs_register('nvme0') failed");
+        printk("4" "NVMe (kmod): register_chrdev('nvme0') failed");
 
-    if (blkdev_register("nvme0", ndev.max_lba, nvme_blk_read_sector,
+    if (register_blkdev("nvme0", ndev.max_lba, nvme_blk_read_sector,
                         nvme_blk_write_sector) != 0)
-        klog(KLOG_WARN, "NVMe (kmod): blkdev_register('nvme0') failed");
+        printk("4" "NVMe (kmod): register_blkdev('nvme0') failed");
 
-    char tmp[16]; itoa((int)ndev.max_lba, tmp);
-    kprint("[NVMe] namespace max_lba="); kprint(tmp);
-    kprint(" IRQ=MSI-X\n");
-    klog(KLOG_OK, "NVMe (kmod): IRQ-driven driver attached — /dev/nvme0 registered");
+    char tmp[16]; snprintf(tmp, sizeof(tmp), "%d", (int)((int)ndev.max_lba));
+    printk("[NVMe] namespace max_lba="); printk(tmp);
+    printk(" IRQ=MSI-X\n");
+    printk("6" "NVMe (kmod): IRQ-driven driver attached — /dev/nvme0 registered");
     return 0;
 }
 
@@ -610,5 +608,5 @@ void pci_driver_remove(pci_device_t *dev) {
     int had_any = nvme_attached || devfs_was_registered || ndev.bar != NULL;
     nvme_detach();
     if (had_any)
-        klog(KLOG_OK, "NVMe (kmod): unloaded");
+        printk("6" "NVMe (kmod): unloaded");
 }

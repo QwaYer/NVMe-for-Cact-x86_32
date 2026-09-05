@@ -14,6 +14,7 @@ INSTALL_DIR := $(LOCAL_REPO)/lib
 
 MOD_CFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -nostdlib \
 	-I$(KERN_ROOT)/Cact/kernel/sync \
+	-I$(KERN_ROOT)/Cact/kernel/core \
 	-I$(KERN_ROOT)/Cact/drivers/pci/enum \
 	-I$(KERN_ROOT)/Cact/drivers/pci \
 	-I$(KERN_ROOT)/Cact/fs/vfs \
