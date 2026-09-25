@@ -34,25 +34,8 @@ extern void     irq_spinlock_init   (irq_spinlock_t* lock);
 extern void     irq_spinlock_acquire(irq_spinlock_t* lock);
 extern void     irq_spinlock_release(irq_spinlock_t* lock);
 
-/* MSI-X table entry struct (must match kernel's msi.h) */
-struct msix_table_entry {
-    uint32_t msg_addr_lo;
-    uint32_t msg_addr_hi;
-    uint32_t msg_data;
-    uint32_t vector_ctrl;
-} __attribute__((packed));
-
-extern int      msix_alloc_vector(void);
-extern void     msix_free_vector(int vec);
-extern int      msix_register_handler(int vec, void (*handler)(void));
-extern void     msix_unregister_handler(int vec);
-extern int      pci_msix_support(pci_device_t *dev);
-extern int      pci_msix_table_map(pci_device_t *dev,
-                                   volatile struct msix_table_entry **table_out,
-                                   uint32_t *table_size_out);
-extern int      pci_msix_enable(pci_device_t *dev, int vec,
-                                volatile struct msix_table_entry *table,
-                                unsigned int entry_idx);
+extern int      msidev_register(pci_device_t *dev, void (*handler)(void));
+extern void     msidev_unregister(int vec);
 extern void     mutex_init  (mutex_t* m);
 extern void     mutex_lock  (mutex_t* m);
 extern void     mutex_unlock(mutex_t* m);
@@ -466,8 +449,7 @@ static void nvme_detach(void) {
     }
 
     if (nvme_msix_vector >= 0) {
-        msix_unregister_handler(nvme_msix_vector);
-        msix_free_vector(nvme_msix_vector);
+        msidev_unregister(nvme_msix_vector);
         nvme_msix_vector = -1;
         nvme_irq_armed   = 0;
     }
@@ -533,24 +515,21 @@ int pci_driver_probe(pci_device_t *pdev) {
     cmd |= 0x06u;           /* MEM | BUS_MASTER */
     pci_write_config_dword(ndev.pci_bus, ndev.pci_dev, ndev.pci_fn, 0x04, cmd);
 
-    /* Enable MSI-X for interrupt-driven I/O (replaces poll-only fallback). */
+    /* Interrupt-driven I/O: msidev_register() picks MSI-X when the controller
+     * has it and MSI otherwise, allocating the vector and programming the
+     * device.  The queue path polls when neither is available. */
     {
-        volatile struct msix_table_entry *table = NULL;
-        uint32_t table_size = 0;
         nvme_msix_vector = -1;
-        int cap = pci_msix_support(pdev);
-        if (cap && pci_msix_table_map(pdev, &table, &table_size) == 0 && table_size > 0) {
-            int vec = msix_alloc_vector();
+        {
+            int vec = msidev_register(pdev, nvme_irq_handler);
             if (vec > 0) {
-                msix_register_handler(vec, nvme_irq_handler);
-                pci_msix_enable(pdev, vec, table, 0);
                 nvme_msix_vector = vec;
                 nvme_irq_armed   = 1;
-                printk("6" "NVMe: MSI-X enabled");
+                printk("6" "NVMe: IRQ enabled");
             }
         }
         if (nvme_msix_vector < 0)
-            printk("4" "NVMe: MSI-X unavailable — poll-only");
+            printk("4" "NVMe: no MSI/MSI-X — poll-only");
     }
 
     uint64_t cap = ndev.bar->cap;
@@ -598,7 +577,7 @@ int pci_driver_probe(pci_device_t *pdev) {
 
     char tmp[16]; snprintf(tmp, sizeof(tmp), "%d", (int)((int)ndev.max_lba));
     printk("[NVMe] namespace max_lba="); printk(tmp);
-    printk(" IRQ=MSI-X\n");
+    printk(" IRQ=enabled\n");
     printk("6" "NVMe (kmod): IRQ-driven driver attached — /dev/nvme0 registered");
     return 0;
 }
