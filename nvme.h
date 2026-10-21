@@ -6,6 +6,12 @@
 #define NVME_ADMIN_QUEUE_SIZE  16
 #define NVME_IO_QUEUE_SIZE     64
 #define NVME_SECTOR_SIZE       512
+// Largest addressable LBA in the 32-bit block layer (2 TiB of 512-byte
+// sectors).  A bigger namespace is clamped to this, with a warning.
+#define NVME_MAX_LBA           0xFFFFFFFFu
+// Highest logical-block size supported.  A namespace with 4096-byte blocks
+// (4Kn) is reached through a bounce block; anything above that is refused.
+#define NVME_MAX_LBS           4096
 
 #define NVME_OPC_IDENTIFY      0x06
 #define NVME_OPC_CREATE_IOSQ   0x01
@@ -67,14 +73,17 @@ struct nvme_queue {
     uint16_t cq_head;
     uint16_t cq_phase;
     uint16_t depth;
+    uint32_t last_result;          // CQE.result of the last reaped command
 };
 
 struct nvme_dev {
     volatile struct nvme_bar *bar;
     uint32_t                  bar_phys;
+    uint32_t                  bar_size;
     uint32_t                  db_stride;
     uint32_t                  ns_id;
-    uint32_t                  max_lba;
+    uint32_t                  max_lba;        // capacity in 512-byte sectors
+    uint32_t                  ns_sector_size; // logical block size (512/4096)
     struct nvme_queue         admin_q;
     struct nvme_queue         io_q;
     uint8_t                   pci_bus;
